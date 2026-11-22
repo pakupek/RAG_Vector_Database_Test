@@ -1,0 +1,46 @@
+# Cztery bazy wektorowe w jednym środowisku (slajd 10: zmienna = baza wektorowa).
+# Uwaga: przypnij wersje obrazów, których faktycznie użyjesz w pracy, i opisz je w rozdziale metodycznym.
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    ports: ["6333:6333", "6334:6334"]
+    volumes: ["qdrant_data:/qdrant/storage"]
+
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.27.6
+    ports: ["8080:8080", "50051:50051"]
+    environment:
+      QUERY_DEFAULTS_LIMIT: "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none      # embeddingi liczymy sami (Ollama)
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: node1
+    volumes: ["weaviate_data:/var/lib/weaviate"]
+
+  # Milvus standalone w trybie jednokontenerowym (wbudowany etcd + lokalny magazyn),
+  # bez osobnych usług etcd i MinIO (jak w oficjalnym standalone_embed.sh).
+  milvus:
+    image: milvusdb/milvus:v2.5.4
+    command: ["milvus", "run", "standalone"]
+    security_opt: ["seccomp:unconfined"]
+    environment:
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      ETCD_CONFIG_PATH: /milvus/configs/embedEtcd.yaml
+      COMMON_STORAGETYPE: local
+    ports: ["19530:19530", "9091:9091", "2379:2379"]
+    volumes:
+      - milvus_data:/var/lib/milvus
+      - ./embedEtcd.yaml:/milvus/configs/embedEtcd.yaml:ro
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms2g -Xmx2g"
+    ports: ["9200:9200"]
+    volumes: ["es_data:/usr/share/elasticsearch/data"]
+
+volumes: {qdrant_data: {}, weaviate_data: {}, milvus_data: {}, es_data: {}}

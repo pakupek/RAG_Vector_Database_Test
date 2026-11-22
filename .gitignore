@@ -1,0 +1,60 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python build / distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Testes / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+test-results/
+
+# Type checking / linting
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.dmypy.json
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDE - Visual Studio Code
+.vscode/
+
+# IDE - PyCharm
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
