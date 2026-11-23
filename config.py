@@ -1,20 +1,20 @@
-"""Wspólna konfiguracja eksperymentu (slajdy 10-13).
+"""Wspólna konfiguracja eksperymentu.
 Zmienia się TYLKO baza wektorowa; reszta jest stała i jawna."""
 from dataclasses import dataclass
 
 # --- Modele (Ollama) -------------------------------------------------------
 OLLAMA_HOST = "http://localhost:11434"
-EMBED_MODEL = "qwen3-embedding:0.6b"   # 1024 wymiary, kontekst 32K (slajd 11)
+EMBED_MODEL = "qwen3-embedding:0.6b"   # 1024 wymiary, kontekst 32K
 EMBED_DIM = 1024
-LLM_MODEL = "qwen3:4b"               # slajd 12 - przypnij dokładny tag/kwantyzację
-LLM_TEMPERATURE = 0.0                  # slajd 12
-LLM_SEED = 42                          # slajd 12 - wartość dowolna, ale stała
+LLM_MODEL = "qwen3:4b"               
+LLM_TEMPERATURE = 0.0                 
+LLM_SEED = 42                          
 LLM_THINK = False
 LLM_NUM_CTX = 4096
 LLM_NUM_PREDICT = 256
 LLM_KEEP_ALIVE = "5m"
 
-# --- Parametry wyszukiwania (slajd 13) -------------------------------------
+# --- Parametry wyszukiwania -------------------------------------
 @dataclass(frozen=True)
 class HNSWParams:
     m: int = 16                 # liczba połączeń M

@@ -29,12 +29,34 @@ def chunk(text: str, size=C.CHUNK_SIZE, overlap=C.CHUNK_OVERLAP) -> list[str]:
     return out
 
 
-def show_progress(label: str, current: int, total: int, width: int = 30) -> None:
+def show_progress(
+    label: str,
+    current: int,
+    total: int,
+    started_at: float,
+    width: int = 30,
+) -> None:
     percent = current / total
     filled = int(width * percent)
     bar = "#" * filled + "-" * (width - filled)
     ending = "\n" if current >= total else ""
-    sys.stdout.write(f"\r{label}: [{bar}] {current}/{total} ({percent:.0%}){ending}")
+    if current >= total:
+        eta = "ETA: zakończono"
+    elif current == 0:
+        eta = "ETA: obliczanie"
+    else:
+        elapsed = time.perf_counter() - started_at
+        remaining = elapsed / current * (total - current)
+        remaining_minutes = max(1, int((remaining + 59) // 60))
+        hours, minutes = divmod(remaining_minutes, 60)
+        if hours:
+            duration = f"{hours} godz." + (f" {minutes} min" if minutes else "")
+        else:
+            duration = f"{minutes} min"
+        eta = f"Pozostało: ~{duration}"
+    sys.stdout.write(
+        f"\r{label}: [{bar}] {current}/{total} ({percent:.0%}) | {eta}{ending}"
+    )
     sys.stdout.flush()
 
 
@@ -44,14 +66,15 @@ def embed(
     progress_label: str | None = None,
 ) -> list[list[float]]:
     vecs: list[list[float]] = []
+    started_at = time.perf_counter()
     if progress_label and texts:
-        show_progress(progress_label, 0, len(texts))
+        show_progress(progress_label, 0, len(texts), started_at)
     try:
         for i in range(0, len(texts), batch):
             r = client.embed(model=C.EMBED_MODEL, input=texts[i:i + batch])
             vecs.extend(r["embeddings"])
             if progress_label:
-                show_progress(progress_label, len(vecs), len(texts))
+                show_progress(progress_label, len(vecs), len(texts), started_at)
     finally:
         if progress_label and len(vecs) < len(texts):
             sys.stdout.write("\n")
@@ -105,18 +128,23 @@ def load_documents(
         and ".rag_state" not in path.relative_to(docs_root).parts
     ]
     if paths:
-        show_progress("Wczytywanie dokumentów", 0, len(paths))
+        progress_started_at = time.perf_counter()
+        show_progress("Wczytywanie dokumentów", 0, len(paths), progress_started_at)
 
     for index, path in enumerate(paths, start=1):
         relative_path = path.relative_to(docs_root)
         source = relative_path.as_posix()
-        show_progress(f"Wczytywanie {path.name}", index - 1, len(paths))
+        show_progress(
+            f"Wczytywanie {path.name}", index - 1, len(paths), progress_started_at
+        )
         text = extract_document_text(path)
         documents[source] = (
             file_digest(path),
             chunk(text),
         )
-        show_progress("Wczytywanie dokumentów", index, len(paths))
+        show_progress(
+            "Wczytywanie dokumentów", index, len(paths), progress_started_at
+        )
     return documents
 
 
@@ -290,12 +318,16 @@ def ingest(db: str, docs_dir: str, subdir: str, rebuild: bool = False) -> None:
                     for point_id in old_selected.get(source, {}).get("ids", [])
                 ]
                 deleted = 0
+                progress_started_at = time.perf_counter()
                 try:
                     for i in range(0, len(stale_ids), C.UPSERT_BATCH_SIZE):
                         batch_ids = stale_ids[i:i + C.UPSERT_BATCH_SIZE]
                         store.delete(batch_ids)
                         deleted += len(batch_ids)
-                        show_progress(f"Usuwanie z {name}", deleted, len(stale_ids))
+                        show_progress(
+                            f"Usuwanie z {name}", deleted, len(stale_ids),
+                            progress_started_at,
+                        )
                 finally:
                     if deleted < len(stale_ids):
                         sys.stdout.write("\n")
@@ -310,6 +342,7 @@ def ingest(db: str, docs_dir: str, subdir: str, rebuild: bool = False) -> None:
                     pending_sources.append(source)
 
             indexed = 0
+            progress_started_at = time.perf_counter()
             try:
                 for i in range(0, len(pending_ids), C.UPSERT_BATCH_SIZE):
                     end = i + C.UPSERT_BATCH_SIZE
@@ -320,7 +353,10 @@ def ingest(db: str, docs_dir: str, subdir: str, rebuild: bool = False) -> None:
                         pending_sources[i:end],
                     )
                     indexed += len(pending_ids[i:end])
-                    show_progress(f"Zapis do {name}", indexed, len(pending_ids))
+                    show_progress(
+                        f"Zapis do {name}", indexed, len(pending_ids),
+                        progress_started_at,
+                    )
                 store.finish_ingest()
             finally:
                 if indexed < len(pending_ids):
