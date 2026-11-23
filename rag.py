@@ -1,6 +1,6 @@
 """Potok RAG: dokumenty -> chunking -> embeddingi Qwen3 (Ollama) -> baza wektorowa -> LLM Qwen (Ollama).
 Użycie:
-  python rag.py ingest --db qdrant --docs ./docs
+  python rag.py ingest --db qdrant --docs ./docs --subdir csv
   python rag.py ask    --db milvus  "Jak działa HNSW?"
   python rag.py ask    --db all     "Jak działa HNSW?"   # to samo pytanie do wszystkich 4 baz
 """
@@ -72,10 +72,34 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_documents(docs_root: Path) -> dict[str, tuple[str, list[str]]]:
+def resolve_subdir(docs_dir: str, subdir: str) -> tuple[Path, Path, str]:
+    docs_root = Path(docs_dir).resolve()
+    if not docs_root.is_dir():
+        raise NotADirectoryError(f"Katalog dokumentów nie istnieje: {docs_root}")
+
+    relative_path = Path(subdir)
+    if relative_path.is_absolute():
+        raise ValueError("--subdir musi być ścieżką względną względem --docs")
+
+    selected_root = (docs_root / relative_path).resolve()
+    try:
+        relative_root = selected_root.relative_to(docs_root)
+    except ValueError as error:
+        raise ValueError("--subdir musi znajdować się wewnątrz --docs") from error
+
+    if not relative_root.parts or ".rag_state" in relative_root.parts:
+        raise ValueError("--subdir musi wskazywać podfolder, a nie cały katalog docs lub .rag_state")
+    return docs_root, selected_root, relative_root.as_posix()
+
+
+def load_documents(
+    docs_root: Path,
+    selected_root: Path,
+) -> dict[str, tuple[str, list[str]]]:
     documents = {}
+    paths = sorted(selected_root.rglob("*")) if selected_root.is_dir() else []
     paths = [
-        path for path in sorted(docs_root.rglob("*"))
+        path for path in paths
         if path.is_file()
         and path.suffix.lower() in SUPPORTED_EXTENSIONS
         and ".rag_state" not in path.relative_to(docs_root).parts
@@ -94,6 +118,10 @@ def load_documents(docs_root: Path) -> dict[str, tuple[str, list[str]]]:
         )
         show_progress("Wczytywanie dokumentów", index, len(paths))
     return documents
+
+
+def source_in_subdir(source: str, subdir: str) -> bool:
+    return source == subdir or source.startswith(subdir + "/")
 
 
 def load_manifest(path: Path) -> dict | None:
@@ -140,20 +168,17 @@ def save_manifest(path: Path, manifest: dict) -> None:
     temporary_path.replace(path)
 
 
-def ingest(db: str, docs_dir: str, rebuild: bool = False) -> None:
-    docs_root = Path(docs_dir)
-    documents = load_documents(docs_root)
-    if not any(texts for _, texts in documents.values()):
-        extensions = ", ".join(sorted(SUPPORTED_EXTENSIONS))
-        raise SystemExit(
-            f"Brak obsługiwanych plików ({extensions}) zawierających tekst w {docs_dir}"
-        )
-
+def ingest(db: str, docs_dir: str, subdir: str, rebuild: bool = False) -> None:
+    docs_root, selected_root, selected_subdir = resolve_subdir(docs_dir, subdir)
+    documents = load_documents(docs_root, selected_root)
     names = list(STORES) if db == "all" else [db]
-    current_manifest = make_manifest(documents)
-    previous_manifests = {}
+    selected_manifest = make_manifest(documents)
     stores = {}
-    full_rebuild = {}
+    base_manifests = {}
+    previous_selected_documents = {}
+    changed_sources_by_db = {}
+    removed_sources_by_db = {}
+    create_collections = {}
     try:
         for name in names:
             store = get_store(name)
@@ -162,32 +187,72 @@ def ingest(db: str, docs_dir: str, rebuild: bool = False) -> None:
             previous = load_manifest(state_path)
             compatible = (
                 previous is not None
-                and previous.get("version") == current_manifest["version"]
+                and previous.get("version") == selected_manifest["version"]
                 and previous.get("chunk_size") == C.CHUNK_SIZE
                 and previous.get("chunk_overlap") == C.CHUNK_OVERLAP
             )
-            previous_manifests[name] = previous if compatible else None
-            expected_count = (
-                sum(len(doc.get("ids", [])) for doc in previous["documents"].values())
-                if compatible else -1
-            )
-            full_rebuild[name] = (
-                rebuild
-                or not compatible
-                or not store.collection_exists()
-                or store.count() != expected_count
+            collection_exists = store.collection_exists()
+            point_count = store.count() if collection_exists else 0
+
+            if compatible:
+                base_manifest = previous
+                needs_create = not collection_exists
+                expected_count = sum(
+                    len(document.get("ids", []))
+                    for document in base_manifest["documents"].values()
+                )
+                if point_count != expected_count:
+                    raise RuntimeError(
+                        f"[{name}] liczba punktów ({point_count}) nie zgadza się "
+                        f"z manifestem ({expected_count}). Przerywam, aby nie "
+                        "przebudować danych spoza wybranego podfolderu."
+                    )
+                if not collection_exists and expected_count:
+                    raise RuntimeError(
+                        f"[{name}] manifest istnieje, ale kolekcja nie. "
+                        "Najpierw przywróć zgodną bazę wektorową."
+                    )
+            else:
+                if point_count:
+                    raise RuntimeError(
+                        f"[{name}] baza zawiera {point_count} punktów, ale brakuje "
+                        "zgodnego manifestu. Nie można bezpiecznie indeksować "
+                        "pojedynczego podfolderu; przywróć manifest albo użyj "
+                        "pustej kolekcji."
+                    )
+                base_manifest = make_manifest({})
+                needs_create = True
+
+            old_documents = base_manifest["documents"]
+            selected_old = {
+                source: document
+                for source, document in old_documents.items()
+                if source_in_subdir(source, selected_subdir)
+            }
+            changed_sources = {
+                source for source, (digest, _) in documents.items()
+                if rebuild or selected_old.get(source, {}).get("sha256") != digest
+            }
+            removed_sources = set(selected_old) - set(documents)
+
+            base_manifests[name] = base_manifest
+            previous_selected_documents[name] = selected_old
+            changed_sources_by_db[name] = changed_sources
+            removed_sources_by_db[name] = removed_sources
+            create_collections[name] = needs_create
+
+        if not documents and not any(previous_selected_documents[name] for name in names):
+            extensions = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+            raise SystemExit(
+                f"Brak obsługiwanych plików ({extensions}) lub wcześniej "
+                f"zaindeksowanych dokumentów w podfolderze {selected_subdir}"
             )
 
         needed_chunks: dict[tuple[str, int], str] = {}
         for name in names:
-            old_documents = (
-                previous_manifests[name]["documents"]
-                if not full_rebuild[name] else {}
-            )
-            for source, (digest, texts) in documents.items():
-                if old_documents.get(source, {}).get("sha256") != digest:
-                    for index, text in enumerate(texts):
-                        needed_chunks[(source, index)] = text
+            for source in changed_sources_by_db[name]:
+                for index, text in enumerate(documents[source][1]):
+                    needed_chunks[(source, index)] = text
 
         chunk_keys = list(needed_chunks)
         t0 = time.perf_counter()
@@ -206,26 +271,23 @@ def ingest(db: str, docs_dir: str, rebuild: bool = False) -> None:
             store = stores[name]
             state_path = docs_root / ".rag_state" / f"{name}.json"
             t0 = time.perf_counter()
-            old_documents = (
-                previous_manifests[name]["documents"]
-                if not full_rebuild[name] else {}
-            )
-            changed_sources = {
-                source for source, (digest, _) in documents.items()
-                if old_documents.get(source, {}).get("sha256") != digest
-            }
-            removed_sources = set(old_documents) - set(documents)
-            if not full_rebuild[name] and not changed_sources and not removed_sources:
-                print(f"[{name}] bez zmian; indeks zawiera {store.count()} fragmentów.")
+            old_selected = previous_selected_documents[name]
+            changed_sources = changed_sources_by_db[name]
+            removed_sources = removed_sources_by_db[name]
+            if not changed_sources and not removed_sources and not create_collections[name]:
+                print(
+                    f"[{name}] podfolder {selected_subdir} bez zmian; "
+                    f"indeks zawiera {store.count()} fragmentów."
+                )
                 continue
 
-            if full_rebuild[name]:
+            if create_collections[name]:
                 store.recreate(C.EMBED_DIM)
             else:
                 stale_ids = [
                     point_id
                     for source in sorted(changed_sources | removed_sources)
-                    for point_id in old_documents[source].get("ids", [])
+                    for point_id in old_selected.get(source, {}).get("ids", [])
                 ]
                 deleted = 0
                 try:
@@ -265,12 +327,31 @@ def ingest(db: str, docs_dir: str, rebuild: bool = False) -> None:
                     sys.stdout.write("\n")
                     sys.stdout.flush()
 
+            merged_documents = {
+                source: document
+                for source, document in base_manifests[name]["documents"].items()
+                if not source_in_subdir(source, selected_subdir)
+            }
+            merged_documents.update(selected_manifest["documents"])
+            updated_manifest = {
+                **selected_manifest,
+                "documents": merged_documents,
+            }
             count = store.count()
-            save_manifest(state_path, current_manifest)
-            action = "odtworzono" if full_rebuild[name] else "zaktualizowano"
+            expected_count = sum(
+                len(document.get("ids", []))
+                for document in updated_manifest["documents"].values()
+            )
+            if count != expected_count:
+                raise RuntimeError(
+                    f"[{name}] po aktualizacji baza zawiera {count} punktów, "
+                    f"manifest opisuje {expected_count}."
+                )
+            save_manifest(state_path, updated_manifest)
             print(
-                f"[{name}] {action} indeks: {count} fragmentów; "
-                f"zmieniono {len(pending_ids)}, usunięto źródeł {len(removed_sources)} "
+                f"[{name}] podfolder {selected_subdir}: indeks zawiera {count} "
+                f"fragmentów; zapisano {len(pending_ids)}, "
+                f"usunięto źródeł {len(removed_sources)} "
                 f"w {time.perf_counter()-t0:.2f}s "
                 f"(embeddingi: {embedding_time:.2f}s)"
             )
@@ -357,7 +438,14 @@ if __name__ == "__main__":
     sub = ap.add_subparsers(dest="cmd", required=True)
     choices = [*STORES, "all"]
     a = sub.add_parser("ingest"); a.add_argument("--db", choices=choices, required=True); a.add_argument("--docs", required=True)
-    a.add_argument("--rebuild", action="store_true", help="Wymuś pełne odtworzenie indeksu")
+    a.add_argument(
+        "--subdir", required=True,
+        help="Podfolder względem --docs; ingest całego katalogu docs jest wyłączony",
+    )
+    a.add_argument(
+        "--rebuild", action="store_true",
+        help="Wymuś ponowne embeddingi tylko dla wybranego podfolderu",
+    )
     b = sub.add_parser("ask"); b.add_argument("--db", choices=choices, required=True); b.add_argument("question")
     backup_parser = sub.add_parser("backup", help="Eksportuj lub importuj gotowe wektory")
     backup_sub = backup_parser.add_subparsers(dest="backup_action", required=True)
@@ -373,7 +461,7 @@ if __name__ == "__main__":
     )
     args = ap.parse_args()
     if args.cmd == "ingest":
-        ingest(args.db, args.docs, rebuild=args.rebuild)
+        ingest(args.db, args.docs, args.subdir, rebuild=args.rebuild)
     elif args.cmd == "ask":
         ask(args.db, args.question)
     elif args.backup_action == "export":
