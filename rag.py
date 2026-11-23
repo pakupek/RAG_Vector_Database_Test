@@ -9,6 +9,7 @@ import argparse, hashlib, json, sys, time
 from pathlib import Path
 import ollama
 import config as C
+from backups import export_backup, import_backup
 from document_loaders import SUPPORTED_EXTENSIONS, extract_document_text
 from vectorstores import STORES, get_store, Hit
 
@@ -333,6 +334,24 @@ def ask(db: str, question: str) -> None:
             store.close()
 
 
+def backup_export(db: str, output: str) -> None:
+    store = get_store(db)
+    try:
+        count = export_backup(store, db, Path(output))
+        print(f"[{db}] wyeksportowano {count} punktów do {output}")
+    finally:
+        store.close()
+
+
+def backup_import(db: str, input_path: str, replace: bool = False) -> None:
+    store = get_store(db)
+    try:
+        count = import_backup(store, Path(input_path), replace=replace)
+        print(f"[{db}] zaimportowano {count} punktów z {input_path}")
+    finally:
+        store.close()
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -340,5 +359,24 @@ if __name__ == "__main__":
     a = sub.add_parser("ingest"); a.add_argument("--db", choices=choices, required=True); a.add_argument("--docs", required=True)
     a.add_argument("--rebuild", action="store_true", help="Wymuś pełne odtworzenie indeksu")
     b = sub.add_parser("ask"); b.add_argument("--db", choices=choices, required=True); b.add_argument("question")
+    backup_parser = sub.add_parser("backup", help="Eksportuj lub importuj gotowe wektory")
+    backup_sub = backup_parser.add_subparsers(dest="backup_action", required=True)
+    export_parser = backup_sub.add_parser("export", help="Zapisz punkty bazy do pliku JSONL")
+    export_parser.add_argument("--db", choices=list(STORES), required=True)
+    export_parser.add_argument("--out", required=True)
+    import_parser = backup_sub.add_parser("import", help="Odtwórz punkty z pliku JSONL")
+    import_parser.add_argument("--db", choices=list(STORES), required=True)
+    import_parser.add_argument("--file", required=True)
+    import_parser.add_argument(
+        "--replace", action="store_true",
+        help="Usuń istniejącą kolekcję przed importem",
+    )
     args = ap.parse_args()
-    ingest(args.db, args.docs, rebuild=args.rebuild) if args.cmd == "ingest" else ask(args.db, args.question)
+    if args.cmd == "ingest":
+        ingest(args.db, args.docs, rebuild=args.rebuild)
+    elif args.cmd == "ask":
+        ask(args.db, args.question)
+    elif args.backup_action == "export":
+        backup_export(args.db, args.out)
+    else:
+        backup_import(args.db, args.file, replace=args.replace)

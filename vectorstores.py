@@ -3,9 +3,18 @@ from __future__ import annotations
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Iterator
 import config as C
 
 P = C.PARAMS
+
+
+@dataclass
+class StoredPoint:
+    id: int
+    vector: list[float]
+    text: str
+    source: str
 
 
 @dataclass
@@ -29,6 +38,8 @@ class VectorStore(ABC):
     def delete(self, ids: list[int]) -> None: ...
     @abstractmethod
     def search(self, vector: list[float]) -> list[Hit]: ...
+    @abstractmethod
+    def iter_points(self, batch_size: int) -> Iterator[StoredPoint]: ...
     def finish_ingest(self) -> None: pass
     def count(self) -> int: return -1
     def close(self) -> None: pass
@@ -75,6 +86,30 @@ class QdrantStore(VectorStore):
         return [Hit(p.id, p.payload["text"], p.payload["source"], p.score) for p in r.points]
 
     def count(self): return self.c.count(C.COLLECTION).count
+
+    def iter_points(self, batch_size):
+        offset = None
+        while True:
+            points, offset = self.c.scroll(
+                collection_name=C.COLLECTION,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=True,
+            )
+            for point in points:
+                vector = point.vector
+                if isinstance(vector, dict):
+                    if len(vector) != 1:
+                        raise ValueError("Eksport obsługuje tylko pojedynczy wektor na punkt Qdrant")
+                    vector = next(iter(vector.values()))
+                yield StoredPoint(
+                    int(point.id), vector,
+                    point.payload["text"], point.payload["source"],
+                )
+            if offset is None:
+                break
+
     def close(self): self.c.close()
 
 
@@ -142,6 +177,19 @@ class WeaviateStore(VectorStore):
     def count(self):
         return self.c.collections.get(self.COL).aggregate.over_all(total_count=True).total_count
 
+    def iter_points(self, batch_size):
+        col = self.c.collections.get(self.COL)
+        for item in col.iterator(include_vector=True):
+            vector = item.vector
+            if isinstance(vector, dict):
+                if len(vector) != 1:
+                    raise ValueError("Eksport obsługuje tylko pojedynczy wektor na obiekt Weaviate")
+                vector = next(iter(vector.values()))
+            yield StoredPoint(
+                int(item.properties["doc_id"]), vector,
+                item.properties["text"], item.properties["source"],
+            )
+
     def close(self): self.c.close()
 
 
@@ -188,6 +236,26 @@ class MilvusStore(VectorStore):
         return [Hit(h["id"], h["entity"]["text"], h["entity"]["source"], h["distance"]) for h in r[0]]
 
     def count(self): return self.c.get_collection_stats(C.COLLECTION)["row_count"]
+
+    def iter_points(self, batch_size):
+        iterator = self.c.query_iterator(
+            collection_name=C.COLLECTION,
+            batch_size=batch_size,
+            expr="id >= 0",
+            output_fields=["id", "vector", "text", "source"],
+        )
+        try:
+            while True:
+                rows = iterator.next()
+                if not rows:
+                    break
+                for row in rows:
+                    yield StoredPoint(
+                        int(row["id"]), row["vector"], row["text"], row["source"],
+                    )
+        finally:
+            iterator.close()
+
     def close(self): self.c.close()
 
 
@@ -240,6 +308,21 @@ class ElasticsearchStore(VectorStore):
                 for h in r["hits"]["hits"]]
 
     def count(self): return self.c.count(index=self.INDEX)["count"]
+
+    def iter_points(self, batch_size):
+        from elasticsearch import helpers
+        for hit in helpers.scan(
+            self.c,
+            index=self.INDEX,
+            query={"query": {"match_all": {}}},
+            _source=["vector", "text", "source"],
+            size=batch_size,
+        ):
+            source = hit["_source"]
+            yield StoredPoint(
+                int(hit["_id"]), source["vector"], source["text"], source["source"],
+            )
+
     def close(self): self.c.close()
 
 
